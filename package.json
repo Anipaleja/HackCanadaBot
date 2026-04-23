@@ -1,0 +1,25 @@
+{
+  "name": "notion-task-discord-bot",
+  "version": "1.0.0",
+  "description": "Discord bot that creates Notion tasks and pings assignees.",
+  "type": "module",
+  "main": "src/bot.js",
+  "scripts": {
+    "start": "node src/bot.js",
+    "dev": "node --watch src/bot.js",
+    "deploy:commands": "node src/deploy-commands.js",
+    "lint:check": "node --check src/config.js && node --check src/notion.js && node --check src/bot.js && node --check src/deploy-commands.js"
+  },
+  "keywords": [
+    "discord",
+    "notion",
+    "bot",
+    "tasks"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@notionhq/client": "^2.3.0",
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5"
+  }
+}
