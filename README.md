@@ -2,6 +2,9 @@
 
 This bot lets you run `/task` in Discord, fill a task form, create a page in your Notion task database, and automatically ping the chosen Discord user.
 
+<img width="167" height="176" alt="Screenshot 2026-04-22 at 9 21 48 PM" src="https://github.com/user-attachments/assets/8241582d-2f43-4ffa-a6d5-e962ff726e33" />
+
+
 ## What It Does
 
 - Adds Discord slash commands: `/task` and `/register`
