@@ -37,10 +37,6 @@ This bot lets you run `/task` in Discord, fill a task form, create a page in you
 - `NOTION_DATABASE_ID`: Database ID (from URL or plain ID)
 - `NOTION_PEOPLE_DATABASE_ID`: Database ID for the people lookup database
 
-For your provided URL, the database ID is:
-
-- `2225d88c3a2180539b4cddb7352a4356`
-
 ## Run
 
 1. Register slash command:
