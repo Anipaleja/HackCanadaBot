@@ -37,6 +37,9 @@ function normalizeNotionDatabaseId(raw) {
 export const config = {
   taskCommandName: "task",
   registerCommandName: "register",
+  meCommandName: "me",
+  doneCommandName: "done",
+  departmentCommandName: "department",
   discordBotToken: requireEnv("DISCORD_BOT_TOKEN"),
   discordClientId: requireEnv("DISCORD_CLIENT_ID"),
   discordGuildId: process.env.DISCORD_GUILD_ID?.trim() || "",

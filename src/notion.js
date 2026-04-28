@@ -388,6 +388,115 @@ export async function getPersonEmailByDiscordId(discordUserId) {
   return email || null;
 }
 
+export async function queryTasksByAssignedEmail(assignedEmail) {
+  const database = await getDatabase(config.notionDatabaseId);
+  const schema = database.properties;
+  const propertyName = config.notionAssignedToProperty;
+  const property = getProperty(schema, propertyName);
+  if (!property) {
+    throw new Error(`Notion task property "${propertyName}" was not found.`);
+  }
+
+  const filter = buildExactTextFilter(propertyName, property, assignedEmail);
+  if (!filter) {
+    throw new Error(`Notion task property "${propertyName}" must be a text-like property.`);
+  }
+
+  const result = await notion.databases.query({
+    database_id: config.notionDatabaseId,
+    filter,
+    sorts: [{ property: config.notionDueDateProperty, direction: "ascending" }]
+  });
+
+  return result.results.map((page) => ({
+    pageId: page.id,
+    pageUrl: page.url,
+    taskName: readTextPropertyValue(page.properties[getTitlePropertyName(schema)] || {}),
+    description: readTextPropertyValue(page.properties[config.notionNotesProperty] || {}),
+    dueDate: readTextPropertyValue(page.properties[config.notionDueDateProperty] || {}),
+    assignedTo: readTextPropertyValue(page.properties[config.notionAssignedToProperty] || {}),
+    lead: readTextPropertyValue(page.properties[config.notionLeadProperty] || {}),
+    status: readTextPropertyValue(page.properties[config.notionStatusProperty] || {})
+  }));
+}
+
+export async function queryTasksByLeadEmail(leadEmail, excludeStatuses = ["Done", "Canceled"]) {
+  const database = await getDatabase(config.notionDatabaseId);
+  const schema = database.properties;
+  const propertyName = config.notionLeadProperty;
+  const statusPropertyName = config.notionStatusProperty;
+  const property = getProperty(schema, propertyName);
+  const statusProperty = getProperty(schema, statusPropertyName);
+
+  if (!property) {
+    throw new Error(`Notion task property "${propertyName}" was not found.`);
+  }
+  if (!statusProperty) {
+    throw new Error(`Notion task property "${statusPropertyName}" was not found.`);
+  }
+
+  const leadFilter = buildExactTextFilter(propertyName, property, leadEmail);
+  if (!leadFilter) {
+    throw new Error(`Notion task property "${propertyName}" must be a text-like property.`);
+  }
+
+  const excludeFilters = excludeStatuses.map((status) => ({
+    property: statusPropertyName,
+    status: { does_not_equal: status }
+  }));
+
+  const filter = {
+    and: [leadFilter, ...excludeFilters]
+  };
+
+  const result = await notion.databases.query({
+    database_id: config.notionDatabaseId,
+    filter,
+    sorts: [{ property: config.notionDueDateProperty, direction: "ascending" }]
+  });
+
+  return result.results.map((page) => ({
+    pageId: page.id,
+    pageUrl: page.url,
+    taskName: readTextPropertyValue(page.properties[getTitlePropertyName(schema)] || {}),
+    description: readTextPropertyValue(page.properties[config.notionNotesProperty] || {}),
+    dueDate: readTextPropertyValue(page.properties[config.notionDueDateProperty] || {}),
+    assignedTo: readTextPropertyValue(page.properties[config.notionAssignedToProperty] || {}),
+    lead: readTextPropertyValue(page.properties[config.notionLeadProperty] || {}),
+    status: readTextPropertyValue(page.properties[config.notionStatusProperty] || {})
+  }));
+}
+
+export async function updateTaskStatus(pageId, newStatus) {
+  const database = await getDatabase(config.notionDatabaseId);
+  const schema = database.properties;
+  const propertyName = config.notionStatusProperty;
+  const property = getProperty(schema, propertyName);
+
+  if (!property) {
+    throw new Error(`Notion task property "${propertyName}" was not found.`);
+  }
+
+  const properties = {};
+  if (property.type === "status") {
+    properties[propertyName] = { status: { name: newStatus } };
+  } else if (property.type === "select") {
+    properties[propertyName] = { select: { name: newStatus } };
+  } else {
+    throw new Error(`Notion task property "${propertyName}" type "${property.type}" does not support status updates.`);
+  }
+
+  const page = await notion.pages.update({
+    page_id: pageId,
+    properties
+  });
+
+  return {
+    pageId: page.id,
+    pageUrl: page.url
+  };
+}
+
 export async function createTaskPage(taskInput) {
   const database = await getDatabase(config.notionDatabaseId);
   const schema = database.properties;

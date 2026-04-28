@@ -12,7 +12,7 @@ import {
 } from "discord.js";
 import * as chrono from "chrono-node";
 import { config } from "./config.js";
-import { createTaskPage, getPersonEmailByDiscordId, upsertPersonMapping } from "./notion.js";
+import { createTaskPage, getPersonEmailByDiscordId, upsertPersonMapping, queryTasksByAssignedEmail, queryTasksByLeadEmail, updateTaskStatus } from "./notion.js";
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers]
@@ -23,6 +23,9 @@ const formTtlMs = 10 * 60_000;
 
 const submissionRateByUser = new Map();
 
+const userTaskCache = new Map();
+const taskCacheTtlMs = 30 * 60_000;
+
 function cleanupExpiredForms() {
   const now = Date.now();
   for (const [token, pending] of pendingTaskForms.entries()) {
@@ -30,6 +33,50 @@ function cleanupExpiredForms() {
       pendingTaskForms.delete(token);
     }
   }
+}
+
+function cleanupExpiredTaskCache() {
+  const now = Date.now();
+  for (const [userId, cached] of userTaskCache.entries()) {
+    if (cached.expiresAtMs <= now) {
+      userTaskCache.delete(userId);
+    }
+  }
+}
+
+function cacheUserTasks(userId, tasks) {
+  cleanupExpiredTaskCache();
+  userTaskCache.set(userId, {
+    tasks,
+    expiresAtMs: Date.now() + taskCacheTtlMs
+  });
+}
+
+function getCachedUserTasks(userId) {
+  cleanupExpiredTaskCache();
+  const cached = userTaskCache.get(userId);
+  if (!cached) {
+    return null;
+  }
+  return cached.tasks;
+}
+
+function formatTaskList(tasks, databaseUrl) {
+  if (tasks.length === 0) {
+    return `No tasks found.\n\nTasks database: ${databaseUrl}`;
+  }
+
+  const taskLines = tasks.map((task, index) => {
+    const lines = [
+      `**${index + 1}. ${task.taskName}**`,
+      `Description: ${task.description || "(no description)"}`,
+      `Due Date: ${task.dueDate || "(no due date)"}`,
+      `Status: ${task.status || "(no status)"}\n`
+    ];
+    return lines.join("\n");
+  });
+
+  return taskLines.join("") + `Tasks database: ${databaseUrl}`;
 }
 
 function createPendingTaskForm(requesterId) {
@@ -197,6 +244,141 @@ async function resolveDiscordMember(interaction, rawValue) {
   }
 
   return null;
+}
+
+async function handleMeSlashCommand(interaction) {
+  if (!interaction.inGuild()) {
+    await interaction.reply({
+      content: "This command can only be used inside a Discord server.",
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  try {
+    const userEmail = await getPersonEmailByDiscordId(interaction.user.id);
+    if (!userEmail) {
+      await interaction.editReply({
+        content: "Your Discord account is not registered yet. Run /register first."
+      });
+      return;
+    }
+
+    const tasks = await queryTasksByAssignedEmail(userEmail);
+    cacheUserTasks(interaction.user.id, tasks);
+
+    const taskUrl = `https://notion.so/${config.notionDatabaseId.replace(/-/g, "")}`;
+    const taskList = formatTaskList(tasks, taskUrl);
+
+    await interaction.editReply({
+      content: taskList
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    await interaction.editReply({
+      content: `Failed to fetch tasks: ${message}`
+    });
+  }
+}
+
+async function handleDoneSlashCommand(interaction) {
+  if (!interaction.inGuild()) {
+    await interaction.reply({
+      content: "This command can only be used inside a Discord server.",
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
+  const taskNumber = interaction.options.getInteger("number", true);
+  const tasks = getCachedUserTasks(interaction.user.id);
+
+  if (!tasks || tasks.length === 0) {
+    await interaction.reply({
+      content: "No tasks cached. Run /me first to load your tasks.",
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
+  if (taskNumber < 1 || taskNumber > tasks.length) {
+    await interaction.reply({
+      content: `Task number must be between 1 and ${tasks.length}.`,
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
+  const task = tasks[taskNumber - 1];
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  try {
+    await updateTaskStatus(task.pageId, "Done");
+
+    let pingMessage = `Task "${task.taskName}" marked as done.`;
+    if (task.lead) {
+      const leadUser = await resolveDiscordMember(interaction, task.lead);
+      if (leadUser) {
+        await interaction.channel?.send({
+          content: `<@${leadUser.id}>, the task "${task.taskName}" has been marked as done.`,
+          allowedMentions: {
+            parse: [],
+            users: [leadUser.id],
+            roles: []
+          }
+        }).catch(() => {});
+        pingMessage += ` Pinged <@${leadUser.id}>.`;
+      }
+    }
+
+    await interaction.editReply({
+      content: pingMessage
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    await interaction.editReply({
+      content: `Failed to mark task as done: ${message}`
+    });
+  }
+}
+
+async function handleDepartmentSlashCommand(interaction) {
+  if (!interaction.inGuild()) {
+    await interaction.reply({
+      content: "This command can only be used inside a Discord server.",
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  try {
+    const userEmail = await getPersonEmailByDiscordId(interaction.user.id);
+    if (!userEmail) {
+      await interaction.editReply({
+        content: "Your Discord account is not registered yet. Run /register first."
+      });
+      return;
+    }
+
+    const tasks = await queryTasksByLeadEmail(userEmail);
+    cacheUserTasks(interaction.user.id, tasks);
+
+    const taskUrl = `https://notion.so/${config.notionDatabaseId.replace(/-/g, "")}`;
+    const taskList = formatTaskList(tasks, taskUrl);
+
+    await interaction.editReply({
+      content: taskList
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    await interaction.editReply({
+      content: `Failed to fetch department tasks: ${message}`
+    });
+  }
 }
 
 async function handleRegisterSlashCommand(interaction) {
@@ -428,6 +610,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.isChatInputCommand() && interaction.commandName === config.taskCommandName) {
       await handleTaskSlashCommand(interaction);
+      return;
+    }
+
+    if (interaction.isChatInputCommand() && interaction.commandName === config.meCommandName) {
+      await handleMeSlashCommand(interaction);
+      return;
+    }
+
+    if (interaction.isChatInputCommand() && interaction.commandName === config.doneCommandName) {
+      await handleDoneSlashCommand(interaction);
+      return;
+    }
+
+    if (interaction.isChatInputCommand() && interaction.commandName === config.departmentCommandName) {
+      await handleDepartmentSlashCommand(interaction);
       return;
     }
 
