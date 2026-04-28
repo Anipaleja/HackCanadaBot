@@ -36,11 +36,13 @@ function normalizeNotionDatabaseId(raw) {
 
 export const config = {
   taskCommandName: "task",
+  registerCommandName: "register",
   discordBotToken: requireEnv("DISCORD_BOT_TOKEN"),
   discordClientId: requireEnv("DISCORD_CLIENT_ID"),
   discordGuildId: process.env.DISCORD_GUILD_ID?.trim() || "",
   notionToken: requireEnv("NOTION_TOKEN"),
   notionDatabaseId: normalizeNotionDatabaseId(requireEnv("NOTION_DATABASE_ID")),
+  notionPeopleDatabaseId: normalizeNotionDatabaseId(requireEnv("NOTION_PEOPLE_DATABASE_ID")),
   notionTitleProperty: process.env.NOTION_TITLE_PROPERTY?.trim() || "",
   notionNotesProperty: process.env.NOTION_NOTES_PROPERTY?.trim() || "Notes",
   notionDueDateProperty: process.env.NOTION_DUE_DATE_PROPERTY?.trim() || "Due Date",
@@ -48,6 +50,9 @@ export const config = {
   notionLeadProperty: process.env.NOTION_LEAD_PROPERTY?.trim() || "Lead",
   notionDiscordUserProperty: process.env.NOTION_DISCORD_USER_PROPERTY?.trim() || "Discord User",
   notionStatusProperty: process.env.NOTION_STATUS_PROPERTY?.trim() || "Status",
+  notionPeopleTitleProperty: process.env.NOTION_PEOPLE_TITLE_PROPERTY?.trim() || "",
+  notionPeopleEmailProperty: process.env.NOTION_PEOPLE_EMAIL_PROPERTY?.trim() || "Notion Email",
+  notionPeopleDiscordIdProperty: process.env.NOTION_PEOPLE_DISCORD_ID_PROPERTY?.trim() || "Discord ID",
   defaultTaskStatus: process.env.DEFAULT_TASK_STATUS?.trim() || "Not started",
   pingMessageTemplate:
     process.env.PING_MESSAGE_TEMPLATE?.trim() ||

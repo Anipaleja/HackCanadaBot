@@ -4,8 +4,7 @@ import { config } from "./config.js";
 const notion = new Client({ auth: config.notionToken });
 
 const DATABASE_CACHE_TTL_MS = 5 * 60_000;
-let cachedDatabase = null;
-let cachedAtMs = 0;
+const cachedDatabases = new Map();
 
 function toRichText(content) {
   return [
@@ -20,6 +19,31 @@ function toRichText(content) {
 
 function normalizeText(value) {
   return String(value ?? "").trim();
+}
+
+function readTextPropertyValue(property) {
+  if (!property) {
+    return "";
+  }
+
+  switch (property.type) {
+    case "title":
+      return property.title.map((entry) => entry.plain_text).join("");
+    case "rich_text":
+      return property.rich_text.map((entry) => entry.plain_text).join("");
+    case "email":
+      return property.email ?? "";
+    case "phone_number":
+      return property.phone_number ?? "";
+    case "url":
+      return property.url ?? "";
+    case "select":
+      return property.select?.name ?? "";
+    case "status":
+      return property.status?.name ?? "";
+    default:
+      return "";
+  }
 }
 
 function getProperty(schema, propertyName) {
@@ -181,21 +205,191 @@ function getTitlePropertyName(schema) {
   return Object.keys(schema).find((propertyName) => schema[propertyName].type === "title");
 }
 
-async function getDatabase() {
-  if (cachedDatabase && Date.now() - cachedAtMs < DATABASE_CACHE_TTL_MS) {
-    return cachedDatabase;
+function getTitlePropertyNameForSchema(schema, explicitPropertyName) {
+  if (explicitPropertyName && schema[explicitPropertyName]?.type === "title") {
+    return explicitPropertyName;
+  }
+
+  return Object.keys(schema).find((propertyName) => schema[propertyName].type === "title");
+}
+
+function buildExactTextFilter(propertyName, property, value) {
+  switch (property.type) {
+    case "title":
+      return { [propertyName]: { title: { equals: value } } };
+    case "rich_text":
+      return { [propertyName]: { rich_text: { equals: value } } };
+    case "email":
+      return { [propertyName]: { email: { equals: value } } };
+    case "phone_number":
+      return { [propertyName]: { phone_number: { equals: value } } };
+    case "url":
+      return { [propertyName]: { url: { equals: value } } };
+    case "select":
+      return { [propertyName]: { select: { equals: value } } };
+    case "status":
+      return { [propertyName]: { status: { equals: value } } };
+    default:
+      return null;
+  }
+}
+
+async function getDatabase(databaseId) {
+  const cached = cachedDatabases.get(databaseId);
+  if (cached && Date.now() - cached.cachedAtMs < DATABASE_CACHE_TTL_MS) {
+    return cached.database;
   }
 
   const database = await notion.databases.retrieve({
-    database_id: config.notionDatabaseId
+    database_id: databaseId
   });
-  cachedDatabase = database;
-  cachedAtMs = Date.now();
+  cachedDatabases.set(databaseId, {
+    database,
+    cachedAtMs: Date.now()
+  });
   return database;
 }
 
+async function queryPersonByDiscordId(discordUserId) {
+  const database = await getDatabase(config.notionPeopleDatabaseId);
+  const schema = database.properties;
+  const propertyName = config.notionPeopleDiscordIdProperty;
+  const property = getProperty(schema, propertyName);
+  if (!property) {
+    throw new Error(`Notion people property "${propertyName}" was not found.`);
+  }
+
+  const filter = buildExactTextFilter(propertyName, property, discordUserId);
+  if (!filter) {
+    throw new Error(`Notion people property "${propertyName}" must be a text-like property.`);
+  }
+
+  const result = await notion.databases.query({
+    database_id: config.notionPeopleDatabaseId,
+    filter
+  });
+
+  return {
+    schema,
+    page: result.results[0] ?? null
+  };
+}
+
+function setPageProperty({ properties, schema, propertyName, value, warnings }) {
+  const normalized = normalizeText(value);
+  if (!normalized) {
+    return false;
+  }
+
+  const property = getProperty(schema, propertyName);
+  if (!property) {
+    warnings.push(`Notion property "${propertyName}" was not found. Skipped value "${normalized}".`);
+    return false;
+  }
+
+  switch (property.type) {
+    case "title":
+      properties[propertyName] = { title: toRichText(normalized) };
+      return true;
+    case "rich_text":
+      properties[propertyName] = { rich_text: toRichText(normalized) };
+      return true;
+    case "email":
+      properties[propertyName] = { email: normalized };
+      return true;
+    case "phone_number":
+      properties[propertyName] = { phone_number: normalized };
+      return true;
+    case "url":
+      properties[propertyName] = { url: normalized };
+      return true;
+    default:
+      warnings.push(`Property "${propertyName}" has unsupported type "${property.type}" for text input.`);
+      return false;
+  }
+}
+
+export async function upsertPersonMapping({ discordUserId, discordUserName, notionEmail }) {
+  const database = await getDatabase(config.notionPeopleDatabaseId);
+  const schema = database.properties;
+  const warnings = [];
+  const properties = {};
+
+  const titlePropertyName = getTitlePropertyNameForSchema(schema, config.notionPeopleTitleProperty);
+  if (!titlePropertyName) {
+    throw new Error("Could not find a title property in the Notion people database.");
+  }
+
+  setPageProperty({
+    properties,
+    schema,
+    propertyName: titlePropertyName,
+    value: discordUserName,
+    warnings
+  });
+
+  setPageProperty({
+    properties,
+    schema,
+    propertyName: config.notionPeopleDiscordIdProperty,
+    value: discordUserId,
+    warnings
+  });
+
+  setPageProperty({
+    properties,
+    schema,
+    propertyName: config.notionPeopleEmailProperty,
+    value: notionEmail,
+    warnings
+  });
+
+  const existing = await queryPersonByDiscordId(discordUserId);
+  const page = existing.page;
+
+  if (page) {
+    await notion.pages.update({
+      page_id: page.id,
+      properties
+    });
+    return {
+      pageId: page.id,
+      pageUrl: page.url,
+      warnings
+    };
+  }
+
+  const createdPage = await notion.pages.create({
+    parent: {
+      database_id: config.notionPeopleDatabaseId
+    },
+    properties
+  });
+
+  return {
+    pageId: createdPage.id,
+    pageUrl: createdPage.url,
+    warnings
+  };
+}
+
+export async function getPersonEmailByDiscordId(discordUserId) {
+  const result = await queryPersonByDiscordId(discordUserId);
+  if (!result.page) {
+    return null;
+  }
+
+  const emailProperty = result.schema[config.notionPeopleEmailProperty];
+  if (!emailProperty) {
+    throw new Error(`Notion people property "${config.notionPeopleEmailProperty}" was not found.`);
+  }
+
+  const email = readTextPropertyValue(result.page.properties[config.notionPeopleEmailProperty]);
+  return email || null;
+}
+
 export async function createTaskPage(taskInput) {
-  const database = await getDatabase();
+  const database = await getDatabase(config.notionDatabaseId);
   const schema = database.properties;
   const warnings = [];
   const properties = {};

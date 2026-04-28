@@ -4,16 +4,12 @@ This bot lets you run `/task` in Discord, fill a task form, create a page in you
 
 ## What It Does
 
-- Adds a Discord slash command: `/task`
-- Requires selecting a `discord_user` up front (this is the user that gets pinged)
-- Opens a modal with fields:
-  - Task
-  - Notes
-  - Due Date
-  - Assigned To
-  - Lead
+- Adds Discord slash commands: `/task` and `/register`
+- `/task` asks for the assignee, task name, task description, due date, and then resolves both people through the Notion people database
+- `/register` stores the current Discord user ID with their Notion email in the Notion people database
 - Creates a new Notion database page
 - Sends a channel message pinging the selected Discord user
+- Lets organizers register their Discord ID with a Notion email
 
 ## Setup
 
@@ -36,6 +32,7 @@ This bot lets you run `/task` in Discord, fill a task form, create a page in you
 - `DISCORD_GUILD_ID`: Recommended for fast command registration in one server
 - `NOTION_TOKEN`: Notion integration token
 - `NOTION_DATABASE_ID`: Database ID (from URL or plain ID)
+- `NOTION_PEOPLE_DATABASE_ID`: Database ID for the people lookup database
 
 For your provided URL, the database ID is:
 
@@ -57,11 +54,23 @@ For your provided URL, the database ID is:
 
 ## Command Flow
 
+### `/register`
+
+1. In Discord, run `/register`
+2. Enter your Notion email
+3. Bot saves your Discord ID and email into the people database and replies with an ephemeral confirmation message
+
+### `/task`
+
 1. In Discord, run `/task`
-2. Choose `discord_user`
-3. Fill the modal fields
+2. Enter the assignee Discord tag or user ID
+3. Fill in the task name, description, and a friendly due date like `tomorrow`, `next Friday`, or `2026-04-05`
 4. Submit
-5. Bot creates Notion page and posts a ping message like:
+5. Bot looks up the assignee and creator emails from the people database, creates the Notion task, and posts a ping message like:
+
+Note: Discord does not expose a native calendar picker in this modal flow, so due dates are parsed from natural-language input.
+
+If you want assignee lookup by name instead of ID, enable the Server Members Intent for the bot in the Discord developer portal.
 
    ```text
    @discordUser, there is a new task that you need to do: "Task Name" (Due: 2026-04-25)

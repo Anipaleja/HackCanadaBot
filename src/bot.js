@@ -4,16 +4,18 @@ import {
   Client,
   Events,
   GatewayIntentBits,
+  MessageFlags,
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
   escapeMarkdown
 } from "discord.js";
+import * as chrono from "chrono-node";
 import { config } from "./config.js";
-import { createTaskPage } from "./notion.js";
+import { createTaskPage, getPersonEmailByDiscordId, upsertPersonMapping } from "./notion.js";
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds]
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers]
 });
 
 const pendingTaskForms = new Map();
@@ -30,13 +32,12 @@ function cleanupExpiredForms() {
   }
 }
 
-function createPendingTaskForm(requesterId, discordUserId) {
+function createPendingTaskForm(requesterId) {
   cleanupExpiredForms();
 
   const token = crypto.randomUUID();
   pendingTaskForms.set(token, {
     requesterId,
-    discordUserId,
     expiresAtMs: Date.now() + formTtlMs
   });
   return token;
@@ -91,8 +92,8 @@ function normalizeDateInput(rawDate) {
     return input;
   }
 
-  const parsed = new Date(input);
-  if (Number.isNaN(parsed.getTime())) {
+  const parsed = chrono.parseDate(input, new Date(), { forwardDate: true });
+  if (!parsed || Number.isNaN(parsed.getTime())) {
     return null;
   }
 
@@ -117,19 +118,142 @@ function formatPingMessage({ discordUserId, taskName, dueDate, lead }) {
   return rendered;
 }
 
-async function handleTaskSlashCommand(interaction) {
+function normalizeEmailInput(rawEmail) {
+  const email = String(rawEmail ?? "").trim();
+  if (!email) {
+    return null;
+  }
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return null;
+  }
+
+  return email;
+}
+
+function normalizeDiscordUserInput(rawValue) {
+  const input = String(rawValue ?? "").trim();
+  if (!input) {
+    return null;
+  }
+
+  const mentionMatch = input.match(/^<@!?(\d+)>$/);
+  if (mentionMatch) {
+    return mentionMatch[1];
+  }
+
+  if (/^\d{17,20}$/.test(input)) {
+    return input;
+  }
+
+  return input.replace(/^@/, "");
+}
+
+async function resolveDiscordMember(interaction, rawValue) {
+  const input = normalizeDiscordUserInput(rawValue);
+  if (!input || !interaction.guild) {
+    return null;
+  }
+
+  const exactIdMatch = input.match(/^\d{17,20}$/);
+  if (exactIdMatch) {
+    const fetchedMember = await interaction.guild.members.fetch(input).catch(() => null);
+    if (fetchedMember) {
+      return fetchedMember;
+    }
+  }
+
+  const cachedMembers = interaction.guild.members.cache;
+  const normalizedInput = input.toLowerCase();
+  const matches = cachedMembers.filter((member) => {
+    const candidates = [member.displayName, member.user.username, member.user.globalName ?? ""]
+      .filter(Boolean)
+      .map((value) => value.toLowerCase());
+    return candidates.includes(normalizedInput);
+  });
+
+  if (matches.size === 1) {
+    return matches.first();
+  }
+
+  if (matches.size > 1) {
+    throw new Error(`Multiple Discord members match "${rawValue}". Use a mention or user ID.`);
+  }
+
+  await interaction.guild.members.fetch().catch(() => null);
+  const refreshedMatches = interaction.guild.members.cache.filter((member) => {
+    const candidates = [member.displayName, member.user.username, member.user.globalName ?? ""]
+      .filter(Boolean)
+      .map((value) => value.toLowerCase());
+    return candidates.includes(normalizedInput);
+  });
+
+  if (refreshedMatches.size === 1) {
+    return refreshedMatches.first();
+  }
+
+  if (refreshedMatches.size > 1) {
+    throw new Error(`Multiple Discord members match "${rawValue}". Use a mention or user ID.`);
+  }
+
+  return null;
+}
+
+async function handleRegisterSlashCommand(interaction) {
   if (!interaction.inGuild()) {
     await interaction.reply({
       content: "This command can only be used inside a Discord server.",
-      ephemeral: true
+      flags: MessageFlags.Ephemeral
     });
     return;
   }
 
-  const discordUser = interaction.options.getUser("discord_user", true);
-  const pendingToken = createPendingTaskForm(interaction.user.id, discordUser.id);
+  const notionEmail = normalizeEmailInput(interaction.options.getString("notion_email", true));
+  if (!notionEmail) {
+    await interaction.reply({
+      content: "Please provide a valid email address.",
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
+  const mappingResult = await upsertPersonMapping({
+    discordUserId: interaction.user.id,
+    discordUserName: interaction.member?.displayName ?? interaction.user.username,
+    notionEmail
+  });
+
+  await interaction.reply({
+    content: [
+      `Registered organizer: ${interaction.member?.displayName ?? interaction.user.username}`,
+      `Discord ID: ${interaction.user.id}`,
+      `Notion email: ${notionEmail}`,
+      `Saved to people database: ${mappingResult.pageUrl}`
+    ].join("\n"),
+    flags: MessageFlags.Ephemeral
+  });
+}
+
+async function handleTaskSlashCommand(interaction) {
+  if (!interaction.inGuild()) {
+    await interaction.reply({
+      content: "This command can only be used inside a Discord server.",
+      flags: MessageFlags.Ephemeral
+    });
+    return;
+  }
+
+  const pendingToken = createPendingTaskForm(interaction.user.id);
 
   const modal = new ModalBuilder().setCustomId(`task-modal:${pendingToken}`).setTitle("Add Task");
+  const discordTagInput = new TextInputBuilder()
+    .setCustomId("discord_tag")
+    .setLabel("Discord Tag / User ID")
+    .setStyle(TextInputStyle.Short)
+    .setPlaceholder("@name, mention, or user ID")
+    .setMinLength(2)
+    .setMaxLength(100)
+    .setRequired(true);
   const taskInput = new TextInputBuilder()
     .setCustomId("task_name")
     .setLabel("Task")
@@ -140,43 +264,26 @@ async function handleTaskSlashCommand(interaction) {
     .setRequired(true);
 
   const notesInput = new TextInputBuilder()
-    .setCustomId("notes")
-    .setLabel("Notes")
+    .setCustomId("task_desc")
+    .setLabel("Task Description")
     .setStyle(TextInputStyle.Paragraph)
     .setPlaceholder("Add details")
     .setMaxLength(1800)
-    .setRequired(false);
+    .setRequired(true);
 
   const dueDateInput = new TextInputBuilder()
     .setCustomId("due_date")
     .setLabel("Due Date")
     .setStyle(TextInputStyle.Short)
-    .setPlaceholder("YYYY-MM-DD")
-    .setMaxLength(30)
-    .setRequired(true);
-
-  const assignedToInput = new TextInputBuilder()
-    .setCustomId("assigned_to")
-    .setLabel("Assigned To")
-    .setStyle(TextInputStyle.Short)
-    .setPlaceholder("Optional Notion assignee text")
-    .setMaxLength(200)
-    .setRequired(false);
-
-  const leadInput = new TextInputBuilder()
-    .setCustomId("lead")
-    .setLabel("Lead")
-    .setStyle(TextInputStyle.Short)
-    .setPlaceholder("Who owns completion")
-    .setMaxLength(200)
+    .setPlaceholder("Tomorrow, Apr 5, next Friday")
+    .setMaxLength(80)
     .setRequired(true);
 
   modal.addComponents(
+    new ActionRowBuilder().addComponents(discordTagInput),
     new ActionRowBuilder().addComponents(taskInput),
     new ActionRowBuilder().addComponents(notesInput),
-    new ActionRowBuilder().addComponents(dueDateInput),
-    new ActionRowBuilder().addComponents(assignedToInput),
-    new ActionRowBuilder().addComponents(leadInput)
+    new ActionRowBuilder().addComponents(dueDateInput)
   );
 
   await interaction.showModal(modal);
@@ -188,7 +295,7 @@ async function handleTaskModal(interaction) {
   if (!pending) {
     await interaction.reply({
       content: "This task form expired. Run /task again.",
-      ephemeral: true
+      flags: MessageFlags.Ephemeral
     });
     return;
   }
@@ -198,52 +305,85 @@ async function handleTaskModal(interaction) {
     const retryAfterSeconds = Math.ceil(rateLimitResult.retryAfterMs / 1000);
     await interaction.reply({
       content: `Rate limit hit. Try again in about ${retryAfterSeconds}s.`,
-      ephemeral: true
+      flags: MessageFlags.Ephemeral
     });
     return;
   }
 
+  const rawDiscordTag = interaction.fields.getTextInputValue("discord_tag").trim();
   const taskName = interaction.fields.getTextInputValue("task_name").trim();
-  const notes = interaction.fields.getTextInputValue("notes").trim();
+  const taskDescription = interaction.fields.getTextInputValue("task_desc").trim();
   const dueDateRaw = interaction.fields.getTextInputValue("due_date").trim();
-  const assignedTo = interaction.fields.getTextInputValue("assigned_to").trim();
-  const lead = interaction.fields.getTextInputValue("lead").trim();
 
   const dueDate = normalizeDateInput(dueDateRaw);
   if (!dueDate) {
     await interaction.reply({
-      content: "Due Date is invalid. Use YYYY-MM-DD (example: 2026-04-30).",
-      ephemeral: true
+      content: "Due Date is invalid. Try values like tomorrow, next Friday, Apr 5, or 2026-04-05.",
+      flags: MessageFlags.Ephemeral
     });
     return;
   }
 
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  let assigneeMember;
+  try {
+    assigneeMember = await resolveDiscordMember(interaction, rawDiscordTag);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    await interaction.editReply({
+      content: message,
+    });
+    return;
+  }
+
+  if (!assigneeMember) {
+    await interaction.editReply({
+      content: `Could not find a Discord member matching "${rawDiscordTag}". Use a mention or exact user ID.`,
+    });
+    return;
+  }
+
+  const assigneeEmail = await getPersonEmailByDiscordId(assigneeMember.id);
+  if (!assigneeEmail) {
+    await interaction.editReply({
+      content: `No Notion email is registered for ${assigneeMember.displayName}. Ask them to run /register first.`,
+    });
+    return;
+  }
+
+  const creatorEmail = await getPersonEmailByDiscordId(interaction.user.id);
+  if (!creatorEmail) {
+    await interaction.editReply({
+      content: "Your Discord account is not registered yet. Run /register first so I can look up your Notion email.",
+    });
+    return;
+  }
 
   try {
     const notionResult = await createTaskPage({
       taskName,
-      notes,
+      notes: taskDescription,
       dueDate,
-      assignedTo,
-      lead,
-      discordUserTag: `<@${pending.discordUserId}>`
+      assignedTo: assigneeEmail,
+      lead: creatorEmail,
+      discordUserTag: `<@${assigneeMember.id}>`
     });
 
     let pingWarning = "";
     if (interaction.channel?.isTextBased()) {
       const pingMessage = formatPingMessage({
-        discordUserId: pending.discordUserId,
+        discordUserId: assigneeMember.id,
         taskName,
         dueDate,
-        lead
+        lead: creatorEmail
       });
 
       await interaction.channel.send({
         content: pingMessage,
         allowedMentions: {
           parse: [],
-          users: [pending.discordUserId],
+          users: [assigneeMember.id],
           roles: []
         }
       });
@@ -253,7 +393,7 @@ async function handleTaskModal(interaction) {
 
     const summaryLines = [
       `Task created successfully: ${notionResult.pageUrl}`,
-      `Pinged Discord user: <@${pending.discordUserId}>`
+      `Pinged Discord user: <@${assigneeMember.id}>`
     ];
 
     if (pingWarning) {
@@ -281,6 +421,11 @@ client.once(Events.ClientReady, (readyClient) => {
 
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
+    if (interaction.isChatInputCommand() && interaction.commandName === config.registerCommandName) {
+      await handleRegisterSlashCommand(interaction);
+      return;
+    }
+
     if (interaction.isChatInputCommand() && interaction.commandName === config.taskCommandName) {
       await handleTaskSlashCommand(interaction);
       return;
@@ -295,9 +440,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.isRepliable()) {
       if (interaction.deferred || interaction.replied) {
-        await interaction.followUp({ content: fallbackMessage, ephemeral: true }).catch(() => {});
+        await interaction.followUp({ content: fallbackMessage, flags: MessageFlags.Ephemeral }).catch(() => {});
       } else {
-        await interaction.reply({ content: fallbackMessage, ephemeral: true }).catch(() => {});
+        await interaction.reply({ content: fallbackMessage, flags: MessageFlags.Ephemeral }).catch(() => {});
       }
     }
   }
